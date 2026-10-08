@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  HUSKY: 0
+
+jobs:
+  make:
+    name: Make (${{ matrix.channel }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            channel: windows
+          - os: macos-latest
+            channel: mac
+          - os: ubuntu-latest
+            channel: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Check tag matches package.json
+        shell: bash
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "v$PKG_VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fakeroot dpkg
+
+      - run: npm ci
+      - run: npm run make
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: make-${{ matrix.channel }}
+          path: out/make/**
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub Release
+    needs: make
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: make-*
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.exe
+            artifacts/**/*.zip
+            artifacts/**/*.deb
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  itch:
+    name: Push to itch.io
+    needs: make
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    environment: itch
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+      - run: pnpm build
+
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: make-*
+          path: artifacts
+
+      - name: Install butler
+        run: |
+          curl -L -o butler.zip https://broth.itch.zone/butler/linux-amd64/LATEST/archive/default
+          unzip -q butler.zip -d butler
+          chmod +x butler/butler
+          echo "$PWD/butler" >> "$GITHUB_PATH"
+
+      - name: Push each OS build
+        env:
+          BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+          ITCH_TARGET: mosesintech/boss-tower-tactical-rush
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          for channel in windows mac linux; do
+            zip=$(find "artifacts/make-$channel" -name '*.zip' | head -n 1)
+            if [ -z "$zip" ]; then echo "::error::No zip for $channel"; exit 1; fi
+            butler push "$zip" "$ITCH_TARGET:$channel" --userversion "$VERSION"
+          done
+      - name: Push browser build (html5)
+        env:
+          BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+          ITCH_TARGET: mosesintech/boss-tower-tactical-rush
+        run: |
+          butler push dist "$ITCH_TARGET:html5" \
+            --ignore electron.cjs \
+            --userversion "${GITHUB_REF_NAME#v}"
